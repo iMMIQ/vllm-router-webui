@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>vLLM Router WebUI</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f7f8fa;
+        --panel: #ffffff;
+        --line: #d9dde5;
+        --text: #18202f;
+        --muted: #687386;
+        --accent: #1663d8;
+        --danger: #bf2e2e;
+        --ok: #16794c;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      header {
+        height: 56px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 24px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+      }
+      h1 { font-size: 17px; margin: 0; font-weight: 650; }
+      main { max-width: 1180px; margin: 0 auto; padding: 24px; }
+      section {
+        margin-bottom: 20px;
+        padding: 18px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+      }
+      h2 { margin: 0 0 14px; font-size: 15px; }
+      .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+      .metric { border: 1px solid var(--line); border-radius: 6px; padding: 12px; }
+      .metric b { display: block; font-size: 20px; margin-bottom: 4px; }
+      label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 5px; }
+      input, select {
+        width: 100%;
+        height: 34px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0 9px;
+        background: #fff;
+        color: var(--text);
+      }
+      button {
+        height: 34px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        padding: 0 12px;
+        cursor: pointer;
+      }
+      button.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+      button.danger { color: #fff; background: var(--danger); border-color: var(--danger); }
+      form { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr auto; gap: 10px; align-items: end; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { border-bottom: 1px solid var(--line); padding: 9px 8px; text-align: left; vertical-align: middle; }
+      th { color: var(--muted); font-size: 12px; font-weight: 600; }
+      .status { color: var(--danger); min-height: 20px; }
+      .healthy { color: var(--ok); font-weight: 600; }
+      .unhealthy { color: var(--danger); font-weight: 600; }
+      .toolbar { display: flex; gap: 10px; align-items: center; justify-content: flex-end; }
+      @media (max-width: 820px) {
+        main { padding: 14px; }
+        .grid, form { grid-template-columns: 1fr; }
+        table { display: block; overflow-x: auto; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>vLLM Router WebUI</h1>
+      <div class="toolbar">
+        <span id="status" class="status"></span>
+        <button id="refresh">Refresh</button>
+      </div>
+    </header>
+    <main>
+      <section>
+        <h2>Router State</h2>
+        <div class="grid">
+          <div class="metric"><b id="total-workers">0</b><span>Total workers</span></div>
+          <div class="metric"><b id="healthy-workers">0</b><span>Healthy workers</span></div>
+          <div class="metric"><b id="total-models">0</b><span>Models</span></div>
+          <div class="metric"><b id="default-policy">-</b><span>Default policy</span></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Add Worker</h2>
+        <form id="add-worker">
+          <div>
+            <label for="worker-url">Worker URL</label>
+            <input id="worker-url" name="url" placeholder="http://127.0.0.1:8000" required />
+          </div>
+          <div>
+            <label for="model-id">Model</label>
+            <input id="model-id" name="model_id" placeholder="auto" />
+          </div>
+          <div>
+            <label for="worker-type">Type</label>
+            <select id="worker-type" name="worker_type">
+              <option value="regular">regular</option>
+              <option value="prefill">prefill</option>
+              <option value="decode">decode</option>
+            </select>
+          </div>
+          <div>
+            <label for="worker-policy">Policy hint</label>
+            <select id="worker-policy" name="policy">
+              <option value="">default</option>
+              <option value="round_robin">round_robin</option>
+              <option value="random">random</option>
+              <option value="cache_aware">cache_aware</option>
+              <option value="power_of_two">power_of_two</option>
+              <option value="consistent_hash">consistent_hash</option>
+              <option value="rendezvous_hash">rendezvous_hash</option>
+            </select>
+          </div>
+          <button class="primary" type="submit">Add</button>
+        </form>
+      </section>
+
+      <section>
+        <h2>Policy</h2>
+        <form id="set-policy">
+          <div>
+            <label for="policy-model">Model</label>
+            <input id="policy-model" name="model_id" placeholder="leave empty for default" />
+          </div>
+          <div>
+            <label for="policy-name">Policy</label>
+            <select id="policy-name" name="policy">
+              <option value="round_robin">round_robin</option>
+              <option value="random">random</option>
+              <option value="cache_aware">cache_aware</option>
+              <option value="power_of_two">power_of_two</option>
+              <option value="consistent_hash">consistent_hash</option>
+              <option value="rendezvous_hash">rendezvous_hash</option>
+            </select>
+          </div>
+          <div></div>
+          <div></div>
+          <button class="primary" type="submit">Apply</button>
+        </form>
+      </section>
+
+      <section>
+        <h2>Workers</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>URL</th>
+              <th>Model</th>
+              <th>Type</th>
+              <th>Health</th>
+              <th>Load</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="workers"></tbody>
+        </table>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

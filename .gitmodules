@@ -1,0 +1,3 @@
+[submodule "vendor/router"]
+	path = vendor/router
+	url = https://github.com/iMMIQ/vllm-router-upstream.git

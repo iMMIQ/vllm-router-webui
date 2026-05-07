@@ -49,6 +49,18 @@ The binary is written to:
 target/debug/vllm-router-webui
 ```
 
+For a release binary targeting `aarch64` with glibc `2.34`, use zigbuild:
+
+```bash
+PYO3_CROSS_PYTHON_VERSION=3.11 cargo zigbuild --release --bin vllm-router-webui --target aarch64-unknown-linux-gnu.2.34
+```
+
+The binary is written to:
+
+```bash
+target/aarch64-unknown-linux-gnu/release/vllm-router-webui
+```
+
 ## Test
 
 ```bash

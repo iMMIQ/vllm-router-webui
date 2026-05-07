@@ -43,6 +43,18 @@ cargo build --bin vllm-router-webui
 target/debug/vllm-router-webui
 ```
 
+使用 zigbuild 构建面向 `aarch64`、支持 glibc `2.34` 的 release 二进制：
+
+```bash
+PYO3_CROSS_PYTHON_VERSION=3.11 cargo zigbuild --release --bin vllm-router-webui --target aarch64-unknown-linux-gnu.2.34
+```
+
+二进制输出路径：
+
+```bash
+target/aarch64-unknown-linux-gnu/release/vllm-router-webui
+```
+
 ## 测试
 
 ```bash

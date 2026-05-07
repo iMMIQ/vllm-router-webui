@@ -65,7 +65,8 @@
       }
       button.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
       button.danger { color: #fff; background: var(--danger); border-color: var(--danger); }
-      form { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr auto; gap: 10px; align-items: end; }
+      form, .form-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; align-items: end; }
+      .wide { grid-column: span 2; }
       table { width: 100%; border-collapse: collapse; }
       th, td { border-bottom: 1px solid var(--line); padding: 9px 8px; text-align: left; vertical-align: middle; }
       th { color: var(--muted); font-size: 12px; font-weight: 600; }
@@ -76,7 +77,8 @@
       .toolbar { display: flex; gap: 10px; align-items: center; justify-content: flex-end; }
       @media (max-width: 820px) {
         main { padding: 14px; }
-        .grid, form { grid-template-columns: 1fr; }
+        .grid, form, .form-grid { grid-template-columns: 1fr; }
+        .wide { grid-column: span 1; }
         table { display: block; overflow-x: auto; }
       }
     </style>
@@ -157,9 +159,89 @@
               <option value="rendezvous_hash">rendezvous_hash</option>
             </select>
           </div>
-          <div></div>
-          <div></div>
+          <div>
+            <label for="cache-threshold">Cache threshold</label>
+            <input id="cache-threshold" name="cache_threshold" type="number" min="0" max="1" step="0.01" placeholder="0.3" />
+          </div>
+          <div>
+            <label for="balance-abs-threshold">Abs threshold</label>
+            <input id="balance-abs-threshold" name="balance_abs_threshold" type="number" min="0" step="1" placeholder="64" />
+          </div>
           <button class="primary" type="submit">Apply</button>
+          <div>
+            <label for="balance-rel-threshold">Rel threshold</label>
+            <input id="balance-rel-threshold" name="balance_rel_threshold" type="number" min="0" step="0.1" placeholder="1.5" />
+          </div>
+          <div>
+            <label for="eviction-interval-secs">Eviction secs</label>
+            <input id="eviction-interval-secs" name="eviction_interval_secs" type="number" min="0" step="1" placeholder="120" />
+          </div>
+          <div>
+            <label for="max-tree-size">Max tree size</label>
+            <input id="max-tree-size" name="max_tree_size" type="number" min="1" step="1" placeholder="67108864" />
+          </div>
+          <div>
+            <label for="load-check-interval-secs">Load check secs</label>
+            <input id="load-check-interval-secs" name="load_check_interval_secs" type="number" min="1" step="1" placeholder="5" />
+          </div>
+          <div>
+            <label for="virtual-nodes">Virtual nodes</label>
+            <input id="virtual-nodes" name="virtual_nodes" type="number" min="1" step="1" placeholder="160" />
+          </div>
+        </form>
+      </section>
+
+      <section>
+        <h2>Runtime Config</h2>
+        <form id="set-circuit">
+          <div class="wide">
+            <label for="circuit-url">Worker URL</label>
+            <input id="circuit-url" name="url" placeholder="leave empty for default" />
+          </div>
+          <div>
+            <label for="cb-failure-threshold">CB failures</label>
+            <input id="cb-failure-threshold" name="failure_threshold" type="number" min="1" step="1" placeholder="10" />
+          </div>
+          <div>
+            <label for="cb-success-threshold">CB successes</label>
+            <input id="cb-success-threshold" name="success_threshold" type="number" min="1" step="1" placeholder="3" />
+          </div>
+          <button class="primary" type="submit">Apply</button>
+          <div>
+            <label for="cb-timeout-duration-secs">CB timeout secs</label>
+            <input id="cb-timeout-duration-secs" name="timeout_duration_secs" type="number" min="1" step="1" placeholder="60" />
+          </div>
+          <div>
+            <label for="cb-window-duration-secs">CB window secs</label>
+            <input id="cb-window-duration-secs" name="window_duration_secs" type="number" min="1" step="1" placeholder="120" />
+          </div>
+        </form>
+        <form id="set-health" style="margin-top: 12px;">
+          <div class="wide">
+            <label for="health-url">Worker URL</label>
+            <input id="health-url" name="url" placeholder="leave empty for default" />
+          </div>
+          <div>
+            <label for="health-timeout-secs">Health timeout</label>
+            <input id="health-timeout-secs" name="timeout_secs" type="number" min="1" step="1" placeholder="5" />
+          </div>
+          <div>
+            <label for="health-check-interval-secs">Health interval</label>
+            <input id="health-check-interval-secs" name="check_interval_secs" type="number" min="1" step="1" placeholder="60" />
+          </div>
+          <button class="primary" type="submit">Apply</button>
+          <div class="wide">
+            <label for="health-endpoint">Health endpoint</label>
+            <input id="health-endpoint" name="endpoint" placeholder="/health" />
+          </div>
+          <div>
+            <label for="health-failure-threshold">Health failures</label>
+            <input id="health-failure-threshold" name="failure_threshold" type="number" min="1" step="1" placeholder="3" />
+          </div>
+          <div>
+            <label for="health-success-threshold">Health successes</label>
+            <input id="health-success-threshold" name="success_threshold" type="number" min="1" step="1" placeholder="2" />
+          </div>
         </form>
       </section>
 
@@ -174,6 +256,8 @@
               <th>Health</th>
               <th>Available</th>
               <th>Circuit</th>
+              <th>CB Config</th>
+              <th>Health Config</th>
               <th>Load</th>
               <th>Processed</th>
               <th>Failures</th>

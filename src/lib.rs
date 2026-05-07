@@ -9,15 +9,20 @@ use axum::{
 use clap::Parser;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 use tokio::{net::TcpListener, signal};
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use vllm_router_rs::{
     config::{PolicyConfig, RouterConfig, RoutingMode},
-    core::WorkerType,
+    core::{CircuitBreakerConfig, HealthConfig, Worker, WorkerType},
     metrics::{self, PrometheusConfig},
-    policies::{CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory},
+    policies::{LoadBalancingPolicy, PolicyFactory},
     protocols::worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     routers::{
         router_manager::{RouterId, RouterManager},
@@ -81,6 +86,8 @@ pub struct ControlState {
     client: Client,
     worker_startup_timeout_secs: u64,
     health_endpoint: String,
+    default_circuit_breaker_config: Arc<RwLock<CircuitBreakerConfig>>,
+    default_health_config: Arc<RwLock<HealthConfig>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,6 +98,7 @@ struct Overview {
     workers: Vec<WorkerView>,
     stats: WorkerStatsView,
     metrics: MetricsSummaryView,
+    runtime_config: RuntimeConfigView,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +113,7 @@ struct WorkerView {
     priority: u32,
     cost: f32,
     circuit_breaker: CircuitBreakerView,
+    health_check: HealthConfigView,
     metadata: HashMap<String, String>,
 }
 
@@ -137,6 +146,30 @@ struct CircuitBreakerView {
     total_successes: u64,
     time_since_last_failure_ms: Option<u128>,
     time_since_state_change_ms: u128,
+    config: CircuitBreakerConfigView,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeConfigView {
+    circuit_breaker: CircuitBreakerConfigView,
+    health_check: HealthConfigView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CircuitBreakerConfigView {
+    failure_threshold: u32,
+    success_threshold: u32,
+    timeout_duration_secs: u64,
+    window_duration_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HealthConfigView {
+    timeout_secs: u64,
+    check_interval_secs: u64,
+    endpoint: String,
+    failure_threshold: u32,
+    success_threshold: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +191,13 @@ struct ReplaceWorkerRequest {
 #[derive(Debug, Deserialize)]
 struct PolicyUpdateRequest {
     policy: String,
+    cache_threshold: Option<f32>,
+    balance_abs_threshold: Option<usize>,
+    balance_rel_threshold: Option<f32>,
+    eviction_interval_secs: Option<u64>,
+    max_tree_size: Option<usize>,
+    load_check_interval_secs: Option<u64>,
+    virtual_nodes: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +211,33 @@ struct CircuitActionResponse {
     success: bool,
     message: String,
     worker: WorkerView,
+}
+
+#[derive(Debug, Deserialize)]
+struct CircuitBreakerConfigUpdateRequest {
+    url: Option<String>,
+    failure_threshold: Option<u32>,
+    success_threshold: Option<u32>,
+    timeout_duration_secs: Option<u64>,
+    window_duration_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HealthConfigUpdateRequest {
+    url: Option<String>,
+    timeout_secs: Option<u64>,
+    check_interval_secs: Option<u64>,
+    endpoint: Option<String>,
+    failure_threshold: Option<u32>,
+    success_threshold: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeConfigUpdateResponse {
+    success: bool,
+    message: String,
+    applied_workers: usize,
+    runtime_config: RuntimeConfigView,
 }
 
 pub async fn launch(cli: Cli) -> Result<()> {
@@ -265,6 +332,10 @@ pub async fn build_application(cli: Cli) -> Result<Router> {
         client,
         worker_startup_timeout_secs: cli.worker_startup_timeout_secs,
         health_endpoint: cli.health_endpoint.clone(),
+        default_circuit_breaker_config: Arc::new(RwLock::new(default_circuit_breaker_config(
+            &router_config,
+        ))),
+        default_health_config: Arc::new(RwLock::new(default_health_config(&router_config))),
     };
 
     for worker_url in &cli.worker_urls {
@@ -306,6 +377,11 @@ pub async fn build_application(cli: Cli) -> Result<Router> {
         .route("/api/workers/replace", post(api_replace_worker))
         .route("/api/workers/circuit/open", post(api_force_open_circuit))
         .route("/api/workers/circuit/reset", post(api_reset_circuit))
+        .route(
+            "/api/runtime/circuit-breaker",
+            post(api_update_circuit_breaker_config),
+        )
+        .route("/api/runtime/health", post(api_update_health_config))
         .route("/api/policies/default", post(api_set_default_policy))
         .route(
             "/api/policies/models/{model_id}",
@@ -363,12 +439,6 @@ fn parse_policy_config(policy: &str) -> Result<PolicyConfig> {
     }
 }
 
-fn policy_from_name(
-    policy: &str,
-) -> Result<Arc<dyn vllm_router_rs::policies::LoadBalancingPolicy>> {
-    PolicyFactory::create_by_name(policy).ok_or_else(|| anyhow!("unsupported policy '{policy}'"))
-}
-
 async fn index() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }
@@ -382,7 +452,7 @@ async fn app_js() -> Response {
 }
 
 async fn api_overview(State(state): State<Arc<ControlState>>) -> Json<Overview> {
-    Json(build_overview(&state.app_state))
+    Json(build_overview(&state))
 }
 
 async fn api_add_worker(
@@ -462,8 +532,12 @@ async fn api_set_default_policy(
     State(state): State<Arc<ControlState>>,
     Json(request): Json<PolicyUpdateRequest>,
 ) -> Response {
-    match policy_from_name(&request.policy) {
-        Ok(policy) => {
+    match policy_from_request(&request) {
+        Ok((policy_config, policy)) => {
+            initialize_policy_if_needed(
+                &policy,
+                &state.app_state.context.worker_registry.get_all(),
+            );
             state
                 .app_state
                 .context
@@ -473,7 +547,7 @@ async fn api_set_default_policy(
                 StatusCode::OK,
                 Json(PolicyUpdateResponse {
                     target: "default".to_string(),
-                    policy: request.policy,
+                    policy: policy_config.name().to_string(),
                 }),
             )
                 .into_response()
@@ -487,18 +561,14 @@ async fn api_set_model_policy(
     Path(model_id): Path<String>,
     Json(request): Json<PolicyUpdateRequest>,
 ) -> Response {
-    match policy_from_name(&request.policy) {
-        Ok(policy) => {
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                    let workers = state
-                        .app_state
-                        .context
-                        .worker_registry
-                        .get_by_model_fast(&model_id);
-                    cache_aware.init_workers(&workers);
-                }
-            }
+    match policy_from_request(&request) {
+        Ok((policy_config, policy)) => {
+            let workers = state
+                .app_state
+                .context
+                .worker_registry
+                .get_by_model_fast(&model_id);
+            initialize_policy_if_needed(&policy, &workers);
             state
                 .app_state
                 .context
@@ -508,7 +578,7 @@ async fn api_set_model_policy(
                 StatusCode::OK,
                 Json(PolicyUpdateResponse {
                     target: model_id,
-                    policy: request.policy,
+                    policy: policy_config.name().to_string(),
                 }),
             )
                 .into_response()
@@ -547,10 +617,138 @@ fn policy_error(error: anyhow::Error) -> Response {
         .into_response()
 }
 
+async fn api_update_circuit_breaker_config(
+    State(state): State<Arc<ControlState>>,
+    Json(request): Json<CircuitBreakerConfigUpdateRequest>,
+) -> Response {
+    let current = if let Some(url) = request.url.as_deref() {
+        state
+            .app_state
+            .context
+            .worker_registry
+            .get_by_url(url)
+            .map(|worker| worker.circuit_breaker().config())
+    } else {
+        Some(state.default_circuit_breaker_config.read().unwrap().clone())
+    };
+
+    let Some(current) = current else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(WorkerErrorResponse {
+                error: format!(
+                    "Worker {} not found",
+                    request.url.as_deref().unwrap_or_default()
+                ),
+                code: "WORKER_NOT_FOUND".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let updated = merge_circuit_breaker_config(current, &request);
+    let applied_workers = if let Some(url) = request.url.as_deref() {
+        match state.app_state.context.worker_registry.get_by_url(url) {
+            Some(worker) => {
+                worker.circuit_breaker().update_config(updated);
+                1
+            }
+            None => 0,
+        }
+    } else {
+        *state.default_circuit_breaker_config.write().unwrap() = updated.clone();
+        let workers = state.app_state.context.worker_registry.get_all();
+        for worker in &workers {
+            worker.circuit_breaker().update_config(updated.clone());
+        }
+        workers.len()
+    };
+
+    (
+        StatusCode::OK,
+        Json(RuntimeConfigUpdateResponse {
+            success: true,
+            message: if request.url.is_some() {
+                "Circuit breaker config updated for worker".to_string()
+            } else {
+                "Default circuit breaker config updated".to_string()
+            },
+            applied_workers,
+            runtime_config: runtime_config_view(&state),
+        }),
+    )
+        .into_response()
+}
+
+async fn api_update_health_config(
+    State(state): State<Arc<ControlState>>,
+    Json(request): Json<HealthConfigUpdateRequest>,
+) -> Response {
+    let current = if let Some(url) = request.url.as_deref() {
+        state
+            .app_state
+            .context
+            .worker_registry
+            .get_by_url(url)
+            .map(|worker| worker.health_config())
+    } else {
+        Some(state.default_health_config.read().unwrap().clone())
+    };
+
+    let Some(current) = current else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(WorkerErrorResponse {
+                error: format!(
+                    "Worker {} not found",
+                    request.url.as_deref().unwrap_or_default()
+                ),
+                code: "WORKER_NOT_FOUND".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let updated = merge_health_config(current, &request);
+    let applied_workers = if let Some(url) = request.url.as_deref() {
+        match state.app_state.context.worker_registry.get_by_url(url) {
+            Some(worker) => {
+                worker.update_health_config(updated);
+                1
+            }
+            None => 0,
+        }
+    } else {
+        *state.default_health_config.write().unwrap() = updated.clone();
+        let workers = state.app_state.context.worker_registry.get_all();
+        for worker in &workers {
+            worker.update_health_config(updated.clone());
+        }
+        workers.len()
+    };
+
+    (
+        StatusCode::OK,
+        Json(RuntimeConfigUpdateResponse {
+            success: true,
+            message: if request.url.is_some() {
+                "Health check config updated for worker".to_string()
+            } else {
+                "Default health check config updated".to_string()
+            },
+            applied_workers,
+            runtime_config: runtime_config_view(&state),
+        }),
+    )
+        .into_response()
+}
+
 async fn add_worker_through_manager(
     state: &ControlState,
     mut config: WorkerConfigRequest,
 ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
+    let worker_url = config.url.clone();
+
     wait_for_worker_health(state, &config.url)
         .await
         .map_err(|error| WorkerErrorResponse {
@@ -572,7 +770,16 @@ async fn add_worker_through_manager(
                 code: "ROUTER_MANAGER_UNAVAILABLE".to_string(),
             })?;
 
-    router_manager.add_worker(config).await
+    let response = router_manager.add_worker(config).await?;
+    if let Some(worker) = state
+        .app_state
+        .context
+        .worker_registry
+        .get_by_url(&worker_url)
+    {
+        apply_runtime_defaults_to_worker(state, &worker);
+    }
+    Ok(response)
 }
 
 fn remove_worker_through_manager(
@@ -646,7 +853,8 @@ async fn wait_for_worker_health(state: &ControlState, worker_url: &str) -> Resul
     }
 }
 
-fn build_overview(app_state: &Arc<AppState>) -> Overview {
+fn build_overview(state: &ControlState) -> Overview {
+    let app_state = &state.app_state;
     let stats = app_state.context.worker_registry.stats();
     let workers = app_state
         .context
@@ -690,11 +898,13 @@ fn build_overview(app_state: &Arc<AppState>) -> Overview {
             decode_workers: stats.decode_workers,
         },
         metrics,
+        runtime_config: runtime_config_view(state),
     }
 }
 
 fn worker_to_view(worker: Arc<dyn vllm_router_rs::core::Worker>) -> WorkerView {
     let cb_stats = worker.circuit_breaker().stats();
+    let health_config = worker.health_config();
     WorkerView {
         url: worker.url().to_string(),
         model_id: worker.model_id().to_string(),
@@ -719,8 +929,150 @@ fn worker_to_view(worker: Arc<dyn vllm_router_rs::core::Worker>) -> WorkerView {
                 .time_since_last_failure
                 .map(|duration| duration.as_millis()),
             time_since_state_change_ms: cb_stats.time_since_last_state_change.as_millis(),
+            config: CircuitBreakerConfigView::from_config(&cb_stats.config),
         },
+        health_check: HealthConfigView::from_config(&health_config),
         metadata: worker.metadata().labels.clone(),
+    }
+}
+
+fn default_circuit_breaker_config(router_config: &RouterConfig) -> CircuitBreakerConfig {
+    let mut config = CircuitBreakerConfig {
+        failure_threshold: router_config.circuit_breaker.failure_threshold,
+        success_threshold: router_config.circuit_breaker.success_threshold,
+        timeout_duration: Duration::from_secs(router_config.circuit_breaker.timeout_duration_secs),
+        window_duration: Duration::from_secs(router_config.circuit_breaker.window_duration_secs),
+    };
+    if router_config.disable_circuit_breaker {
+        config.failure_threshold = u32::MAX;
+    }
+    config
+}
+
+fn default_health_config(router_config: &RouterConfig) -> HealthConfig {
+    HealthConfig {
+        timeout_secs: router_config.health_check.timeout_secs,
+        check_interval_secs: router_config.health_check.check_interval_secs,
+        endpoint: router_config.health_check.endpoint.clone(),
+        failure_threshold: router_config.health_check.failure_threshold,
+        success_threshold: router_config.health_check.success_threshold,
+    }
+}
+
+fn runtime_config_view(state: &ControlState) -> RuntimeConfigView {
+    RuntimeConfigView {
+        circuit_breaker: CircuitBreakerConfigView::from_config(
+            &state.default_circuit_breaker_config.read().unwrap(),
+        ),
+        health_check: HealthConfigView::from_config(&state.default_health_config.read().unwrap()),
+    }
+}
+
+impl CircuitBreakerConfigView {
+    fn from_config(config: &CircuitBreakerConfig) -> Self {
+        Self {
+            failure_threshold: config.failure_threshold,
+            success_threshold: config.success_threshold,
+            timeout_duration_secs: config.timeout_duration.as_secs(),
+            window_duration_secs: config.window_duration.as_secs(),
+        }
+    }
+}
+
+impl HealthConfigView {
+    fn from_config(config: &HealthConfig) -> Self {
+        Self {
+            timeout_secs: config.timeout_secs,
+            check_interval_secs: config.check_interval_secs,
+            endpoint: config.endpoint.clone(),
+            failure_threshold: config.failure_threshold,
+            success_threshold: config.success_threshold,
+        }
+    }
+}
+
+fn merge_circuit_breaker_config(
+    mut config: CircuitBreakerConfig,
+    request: &CircuitBreakerConfigUpdateRequest,
+) -> CircuitBreakerConfig {
+    if let Some(failure_threshold) = request.failure_threshold {
+        config.failure_threshold = failure_threshold;
+    }
+    if let Some(success_threshold) = request.success_threshold {
+        config.success_threshold = success_threshold;
+    }
+    if let Some(timeout_duration_secs) = request.timeout_duration_secs {
+        config.timeout_duration = Duration::from_secs(timeout_duration_secs);
+    }
+    if let Some(window_duration_secs) = request.window_duration_secs {
+        config.window_duration = Duration::from_secs(window_duration_secs);
+    }
+    config
+}
+
+fn merge_health_config(
+    mut config: HealthConfig,
+    request: &HealthConfigUpdateRequest,
+) -> HealthConfig {
+    if let Some(timeout_secs) = request.timeout_secs {
+        config.timeout_secs = timeout_secs;
+    }
+    if let Some(check_interval_secs) = request.check_interval_secs {
+        config.check_interval_secs = check_interval_secs;
+    }
+    if let Some(endpoint) = request.endpoint.as_ref() {
+        config.endpoint = endpoint.clone();
+    }
+    if let Some(failure_threshold) = request.failure_threshold {
+        config.failure_threshold = failure_threshold;
+    }
+    if let Some(success_threshold) = request.success_threshold {
+        config.success_threshold = success_threshold;
+    }
+    config
+}
+
+fn apply_runtime_defaults_to_worker(state: &ControlState, worker: &Arc<dyn Worker>) {
+    worker
+        .circuit_breaker()
+        .update_config(state.default_circuit_breaker_config.read().unwrap().clone());
+    worker.update_health_config(state.default_health_config.read().unwrap().clone());
+}
+
+fn policy_from_request(
+    request: &PolicyUpdateRequest,
+) -> Result<(PolicyConfig, Arc<dyn LoadBalancingPolicy>)> {
+    let config = policy_config_from_request(request)?;
+    let policy = PolicyFactory::create_from_config(&config);
+    Ok((config, policy))
+}
+
+fn policy_config_from_request(request: &PolicyUpdateRequest) -> Result<PolicyConfig> {
+    let policy = request.policy.to_lowercase();
+    match policy.as_str() {
+        "random" => Ok(PolicyConfig::Random),
+        "round_robin" | "roundrobin" => Ok(PolicyConfig::RoundRobin),
+        "cache_aware" | "cacheaware" => Ok(PolicyConfig::CacheAware {
+            cache_threshold: request.cache_threshold.unwrap_or(0.3),
+            balance_abs_threshold: request.balance_abs_threshold.unwrap_or(64),
+            balance_rel_threshold: request.balance_rel_threshold.unwrap_or(1.5),
+            eviction_interval_secs: request.eviction_interval_secs.unwrap_or(120),
+            max_tree_size: request.max_tree_size.unwrap_or(67_108_864),
+        }),
+        "power_of_two" | "poweroftwo" => Ok(PolicyConfig::PowerOfTwo {
+            load_check_interval_secs: request.load_check_interval_secs.unwrap_or(5),
+        }),
+        "consistent_hash" | "consistenthash" => Ok(PolicyConfig::ConsistentHash {
+            virtual_nodes: request.virtual_nodes.unwrap_or(160),
+        }),
+        "rendezvous_hash" | "rendezvoushash" => Ok(PolicyConfig::RendezvousHash),
+        other => Err(anyhow!("unsupported policy '{other}'")),
+    }
+}
+
+fn initialize_policy_if_needed(policy: &Arc<dyn LoadBalancingPolicy>, workers: &[Arc<dyn Worker>]) {
+    if policy.requires_initialization() {
+        policy.init_workers(workers);
     }
 }
 

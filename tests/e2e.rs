@@ -474,6 +474,174 @@ async fn circuit_control_opens_and_resets_worker_availability() {
 }
 
 #[tokio::test]
+async fn runtime_configs_update_without_interrupting_routing() {
+    let webui = spawn_webui().await;
+    let worker = spawn_worker("worker-a", "test-model").await;
+    let client = reqwest::Client::new();
+
+    let add = client
+        .post(format!("{}/api/workers", webui.base_url))
+        .json(&json!({
+            "url": worker.base_url,
+            "model_id": "test-model",
+            "worker_type": "regular"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(add.status(), reqwest::StatusCode::OK);
+
+    let circuit = client
+        .post(format!("{}/api/runtime/circuit-breaker", webui.base_url))
+        .json(&json!({
+            "failure_threshold": 2,
+            "success_threshold": 1,
+            "timeout_duration_secs": 7,
+            "window_duration_secs": 11
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        circuit.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        circuit.text().await.unwrap()
+    );
+
+    let health = client
+        .post(format!("{}/api/runtime/health", webui.base_url))
+        .json(&json!({
+            "timeout_secs": 2,
+            "check_interval_secs": 3,
+            "endpoint": "/health",
+            "failure_threshold": 4,
+            "success_threshold": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        health.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        health.text().await.unwrap()
+    );
+
+    let overview: Value = client
+        .get(format!("{}/api/overview", webui.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        overview["runtime_config"]["circuit_breaker"]["failure_threshold"],
+        2
+    );
+    assert_eq!(
+        overview["workers"][0]["circuit_breaker"]["config"]["timeout_duration_secs"],
+        7
+    );
+    assert_eq!(
+        overview["runtime_config"]["health_check"]["timeout_secs"],
+        2
+    );
+    assert_eq!(
+        overview["workers"][0]["health_check"]["failure_threshold"],
+        4
+    );
+
+    let routed = client
+        .post(format!("{}/v1/completions", webui.base_url))
+        .json(&json!({
+            "model": "test-model",
+            "prompt": "still routes",
+            "max_tokens": 1,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(routed.status(), reqwest::StatusCode::OK);
+    assert_eq!(routed.headers().get("x-worker-id").unwrap(), "worker-a");
+}
+
+#[tokio::test]
+async fn added_workers_inherit_updated_runtime_defaults() {
+    let webui = spawn_webui().await;
+    let worker = spawn_worker("worker-a", "test-model").await;
+    let client = reqwest::Client::new();
+
+    let circuit = client
+        .post(format!("{}/api/runtime/circuit-breaker", webui.base_url))
+        .json(&json!({
+            "failure_threshold": 3,
+            "success_threshold": 1,
+            "timeout_duration_secs": 9,
+            "window_duration_secs": 13
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(circuit.status(), reqwest::StatusCode::OK);
+
+    let health = client
+        .post(format!("{}/api/runtime/health", webui.base_url))
+        .json(&json!({
+            "timeout_secs": 4,
+            "check_interval_secs": 5,
+            "endpoint": "/health",
+            "failure_threshold": 6,
+            "success_threshold": 2
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), reqwest::StatusCode::OK);
+
+    let add = client
+        .post(format!("{}/api/workers", webui.base_url))
+        .json(&json!({
+            "url": worker.base_url,
+            "model_id": "test-model",
+            "worker_type": "regular"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        add.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        add.text().await.unwrap()
+    );
+
+    let overview: Value = client
+        .get(format!("{}/api/overview", webui.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        overview["workers"][0]["circuit_breaker"]["config"]["failure_threshold"],
+        3
+    );
+    assert_eq!(
+        overview["workers"][0]["circuit_breaker"]["config"]["window_duration_secs"],
+        13
+    );
+    assert_eq!(overview["workers"][0]["health_check"]["timeout_secs"], 4);
+    assert_eq!(
+        overview["workers"][0]["health_check"]["failure_threshold"],
+        6
+    );
+}
+
+#[tokio::test]
 async fn prometheus_metrics_server_can_be_enabled() {
     let metrics_port = pick_unused_port().expect("free prometheus port");
     let mut cli = test_cli(pick_unused_port().expect("free webui port"));

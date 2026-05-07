@@ -6,6 +6,7 @@ use axum::{
 };
 use portpicker::pick_unused_port;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::{net::TcpListener, task::JoinHandle, time::Duration};
 use vllm_router_webui::{build_application, Cli};
@@ -40,7 +41,17 @@ fn test_cli(port: u16) -> Cli {
         max_concurrent_requests: 128,
         prometheus_host: "127.0.0.1".to_string(),
         prometheus_port: None,
+        state_file: None,
+        max_revisions: 50,
     }
+}
+
+fn temp_state_file(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "vllm-router-webui-{name}-{}-{}.json",
+        std::process::id(),
+        pick_unused_port().expect("unique suffix")
+    ))
 }
 
 async fn spawn_webui() -> TestServer {
@@ -642,15 +653,224 @@ async fn added_workers_inherit_updated_runtime_defaults() {
 }
 
 #[tokio::test]
+async fn persists_runtime_config_and_restores_after_restart() {
+    let state_file = temp_state_file("restore");
+    let worker = spawn_worker("worker-a", "test-model").await;
+    let client = reqwest::Client::new();
+
+    {
+        let mut cli = test_cli(pick_unused_port().expect("free webui port"));
+        cli.state_file = Some(state_file.clone());
+        let webui = spawn_webui_with_cli(cli).await;
+
+        let add = client
+            .post(format!("{}/api/workers", webui.base_url))
+            .json(&json!({
+                "url": worker.base_url,
+                "model_id": "test-model",
+                "worker_type": "regular"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(add.status(), reqwest::StatusCode::OK);
+
+        let policy = client
+            .post(format!("{}/api/policies/models/test-model", webui.base_url))
+            .json(&json!({ "policy": "random" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(policy.status(), reqwest::StatusCode::OK);
+
+        let circuit = client
+            .post(format!("{}/api/runtime/circuit-breaker", webui.base_url))
+            .json(&json!({
+                "failure_threshold": 2,
+                "success_threshold": 1,
+                "timeout_duration_secs": 8,
+                "window_duration_secs": 12
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(circuit.status(), reqwest::StatusCode::OK);
+
+        let overview: Value = client
+            .get(format!("{}/api/overview", webui.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(overview["config"]["persistence_enabled"], true);
+        assert!(overview["config"]["revision_count"].as_u64().unwrap() >= 4);
+    }
+
+    {
+        let mut cli = test_cli(pick_unused_port().expect("free webui port"));
+        cli.state_file = Some(state_file.clone());
+        let webui = spawn_webui_with_cli(cli).await;
+
+        let overview: Value = client
+            .get(format!("{}/api/overview", webui.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(overview["stats"]["total_workers"], 1);
+        assert_eq!(overview["workers"][0]["url"], worker.base_url);
+        assert_eq!(overview["model_policies"]["test-model"], "random");
+        assert_eq!(
+            overview["runtime_config"]["circuit_breaker"]["failure_threshold"],
+            2
+        );
+        assert_eq!(
+            overview["workers"][0]["circuit_breaker"]["config"]["timeout_duration_secs"],
+            8
+        );
+    }
+
+    let _ = std::fs::remove_file(state_file);
+}
+
+#[tokio::test]
+async fn config_history_rolls_back_worker_policy_and_runtime_config() {
+    let state_file = temp_state_file("rollback");
+    let worker_a = spawn_worker("worker-a", "test-model").await;
+    let worker_b = spawn_worker("worker-b", "test-model").await;
+    let client = reqwest::Client::new();
+    let mut cli = test_cli(pick_unused_port().expect("free webui port"));
+    cli.state_file = Some(state_file.clone());
+    let webui = spawn_webui_with_cli(cli).await;
+
+    let add_a = client
+        .post(format!("{}/api/workers", webui.base_url))
+        .json(&json!({
+            "url": worker_a.base_url,
+            "model_id": "test-model",
+            "worker_type": "regular"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(add_a.status(), reqwest::StatusCode::OK);
+
+    let history: Value = client
+        .get(format!("{}/api/config/history", webui.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rollback_revision = history["current_revision"].as_u64().unwrap();
+
+    let add_b = client
+        .post(format!("{}/api/workers", webui.base_url))
+        .json(&json!({
+            "url": worker_b.base_url,
+            "model_id": "test-model",
+            "worker_type": "regular"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(add_b.status(), reqwest::StatusCode::OK);
+
+    let policy = client
+        .post(format!("{}/api/policies/models/test-model", webui.base_url))
+        .json(&json!({ "policy": "random" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(policy.status(), reqwest::StatusCode::OK);
+
+    let circuit = client
+        .post(format!("{}/api/runtime/circuit-breaker", webui.base_url))
+        .json(&json!({
+            "failure_threshold": 2,
+            "timeout_duration_secs": 8
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(circuit.status(), reqwest::StatusCode::OK);
+
+    let rollback = client
+        .post(format!("{}/api/config/rollback", webui.base_url))
+        .json(&json!({ "revision_id": rollback_revision }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rollback.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        rollback.text().await.unwrap()
+    );
+
+    let overview: Value = client
+        .get(format!("{}/api/overview", webui.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(overview["stats"]["total_workers"], 1);
+    assert_eq!(overview["workers"][0]["url"], worker_a.base_url);
+    assert!(overview["model_policies"].get("test-model").is_none());
+    assert_ne!(
+        overview["runtime_config"]["circuit_breaker"]["failure_threshold"],
+        2
+    );
+
+    let _ = std::fs::remove_file(state_file);
+}
+
+#[tokio::test]
 async fn prometheus_metrics_server_can_be_enabled() {
     let metrics_port = pick_unused_port().expect("free prometheus port");
     let mut cli = test_cli(pick_unused_port().expect("free webui port"));
     cli.prometheus_port = Some(metrics_port);
-    let _webui = spawn_webui_with_cli(cli).await;
+    let webui = spawn_webui_with_cli(cli).await;
+    let worker = spawn_worker("worker-a", "test-model").await;
+    let client = reqwest::Client::new();
     let metrics_url = format!("http://127.0.0.1:{metrics_port}/metrics");
 
+    let add = client
+        .post(format!("{}/api/workers", webui.base_url))
+        .json(&json!({
+            "url": worker.base_url,
+            "model_id": "test-model",
+            "worker_type": "regular"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(add.status(), reqwest::StatusCode::OK);
+
+    let routed = client
+        .post(format!("{}/v1/completions", webui.base_url))
+        .json(&json!({
+            "model": "test-model",
+            "prompt": "metrics",
+            "max_tokens": 1,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(routed.status(), reqwest::StatusCode::OK);
+
     wait_for_http_ok(&metrics_url).await;
-    let body = reqwest::get(metrics_url)
+    let body = client
+        .get(metrics_url)
+        .send()
         .await
         .unwrap()
         .text()

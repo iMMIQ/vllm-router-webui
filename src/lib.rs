@@ -11,9 +11,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fs,
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{net::TcpListener, signal};
 use tower_http::cors::CorsLayer;
@@ -78,6 +80,14 @@ pub struct Cli {
     /// Port for the optional Prometheus metrics server. Disabled when omitted.
     #[arg(long)]
     pub prometheus_port: Option<u16>,
+
+    /// JSON file used to persist WebUI control-plane state. Disabled when omitted.
+    #[arg(long)]
+    pub state_file: Option<PathBuf>,
+
+    /// Maximum number of config revisions kept in the persisted state file.
+    #[arg(long, default_value_t = 50)]
+    pub max_revisions: usize,
 }
 
 #[derive(Clone)]
@@ -88,6 +98,10 @@ pub struct ControlState {
     health_endpoint: String,
     default_circuit_breaker_config: Arc<RwLock<CircuitBreakerConfig>>,
     default_health_config: Arc<RwLock<HealthConfig>>,
+    config_store: Arc<RwLock<ConfigStore>>,
+    state_file: Option<PathBuf>,
+    max_revisions: usize,
+    metric_history: Arc<RwLock<Vec<MetricPoint>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +113,8 @@ struct Overview {
     stats: WorkerStatsView,
     metrics: MetricsSummaryView,
     runtime_config: RuntimeConfigView,
+    config: ConfigMetadataView,
+    trends: Vec<MetricPoint>,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,7 +171,7 @@ struct RuntimeConfigView {
     health_check: HealthConfigView,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CircuitBreakerConfigView {
     failure_threshold: u32,
     success_threshold: u32,
@@ -163,7 +179,7 @@ struct CircuitBreakerConfigView {
     window_duration_secs: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HealthConfigView {
     timeout_secs: u64,
     check_interval_secs: u64,
@@ -188,7 +204,7 @@ struct ReplaceWorkerRequest {
     new_worker: WorkerConfigRequest,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PolicyUpdateRequest {
     policy: String,
     cache_threshold: Option<f32>,
@@ -240,6 +256,77 @@ struct RuntimeConfigUpdateResponse {
     runtime_config: RuntimeConfigView,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConfigStore {
+    current: PersistedConfig,
+    revisions: Vec<ConfigRevision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedConfig {
+    workers: Vec<WorkerConfigRequest>,
+    default_policy: PolicyUpdateRequest,
+    model_policies: HashMap<String, PolicyUpdateRequest>,
+    default_circuit_breaker: CircuitBreakerConfigView,
+    default_health: HealthConfigView,
+    worker_circuit_breakers: HashMap<String, CircuitBreakerConfigView>,
+    worker_health: HashMap<String, HealthConfigView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConfigRevision {
+    id: u64,
+    timestamp_secs: u64,
+    description: String,
+    config: PersistedConfig,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConfigMetadataView {
+    current_revision: Option<u64>,
+    revision_count: usize,
+    persistence_enabled: bool,
+    state_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConfigHistoryView {
+    current_revision: Option<u64>,
+    revisions: Vec<ConfigRevisionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConfigRevisionSummary {
+    id: u64,
+    timestamp_secs: u64,
+    description: String,
+    workers: usize,
+    model_policies: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct RollbackRequest {
+    revision_id: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigActionResponse {
+    success: bool,
+    message: String,
+    current_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MetricPoint {
+    timestamp_secs: u64,
+    total_workers: usize,
+    healthy_workers: usize,
+    unavailable_workers: usize,
+    open_circuits: usize,
+    max_worker_load: usize,
+    total_processed_requests: usize,
+}
+
 pub async fn launch(cli: Cli) -> Result<()> {
     let app = build_application(cli.clone()).await?;
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port)
@@ -256,6 +343,7 @@ pub async fn launch(cli: Cli) -> Result<()> {
 
 pub async fn build_application(cli: Cli) -> Result<Router> {
     let router_config = build_router_config(&cli)?;
+    let persisted_store = load_config_store(cli.state_file.as_ref())?;
     if let Some(port) = cli.prometheus_port {
         metrics::start_prometheus(PrometheusConfig {
             host: cli.prometheus_host.clone(),
@@ -327,31 +415,44 @@ pub async fn build_application(cli: Cli) -> Result<Router> {
         .worker_registry
         .start_health_checker(router_config.health_check.check_interval_secs);
 
+    let initial_config = initial_persisted_config(&cli, &router_config, persisted_store.as_ref())?;
     let control_state = ControlState {
         app_state: app_state.clone(),
         client,
         worker_startup_timeout_secs: cli.worker_startup_timeout_secs,
         health_endpoint: cli.health_endpoint.clone(),
-        default_circuit_breaker_config: Arc::new(RwLock::new(default_circuit_breaker_config(
-            &router_config,
-        ))),
-        default_health_config: Arc::new(RwLock::new(default_health_config(&router_config))),
+        default_circuit_breaker_config: Arc::new(RwLock::new(
+            initial_config.default_circuit_breaker.to_core_config(),
+        )),
+        default_health_config: Arc::new(RwLock::new(
+            initial_config.default_health.to_core_config(),
+        )),
+        config_store: Arc::new(RwLock::new(
+            persisted_store.unwrap_or_else(|| ConfigStore::new(initial_config.clone())),
+        )),
+        state_file: cli.state_file.clone(),
+        max_revisions: cli.max_revisions.max(1),
+        metric_history: Arc::new(RwLock::new(Vec::new())),
     };
 
-    for worker_url in &cli.worker_urls {
-        let config = WorkerConfigRequest {
-            url: worker_url.clone(),
-            model_id: None,
-            priority: None,
-            cost: None,
-            worker_type: Some("regular".to_string()),
-            bootstrap_port: None,
-            labels: HashMap::new(),
-        };
+    apply_default_policy_request(&control_state, &initial_config.default_policy)?;
+
+    for (model_id, policy_request) in &initial_config.model_policies {
+        apply_model_policy_request(&control_state, model_id, policy_request)?;
+    }
+
+    for config in initial_config.workers.clone() {
+        let worker_url = config.url.clone();
         if let Err(e) = add_worker_through_manager(&control_state, config).await {
-            warn!("Failed to add initial worker {}: {}", worker_url, e.error);
+            warn!(
+                "Failed to add persisted or initial worker {}: {}",
+                worker_url, e.error
+            );
         }
     }
+
+    apply_runtime_snapshot(&control_state, &initial_config);
+    persist_revision(&control_state, "initial state")?;
 
     let upstream_app = server::build_app_with_request_tracing(
         app_state,
@@ -382,6 +483,8 @@ pub async fn build_application(cli: Cli) -> Result<Router> {
             post(api_update_circuit_breaker_config),
         )
         .route("/api/runtime/health", post(api_update_health_config))
+        .route("/api/config/history", get(api_config_history))
+        .route("/api/config/rollback", post(api_config_rollback))
         .route("/api/policies/default", post(api_set_default_policy))
         .route(
             "/api/policies/models/{model_id}",
@@ -459,8 +562,14 @@ async fn api_add_worker(
     State(state): State<Arc<ControlState>>,
     Json(config): Json<WorkerConfigRequest>,
 ) -> Response {
-    match add_worker_through_manager(&state, config).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+    match add_worker_through_manager(&state, config.clone()).await {
+        Ok(response) => {
+            upsert_persisted_worker(&state, config);
+            if let Err(error) = persist_revision(&state, "worker added") {
+                return persistence_error(error);
+            }
+            (StatusCode::OK, Json(response)).into_response()
+        }
         Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
     }
 }
@@ -470,7 +579,13 @@ async fn api_remove_worker(
     Json(request): Json<RemoveWorkerRequest>,
 ) -> Response {
     match remove_worker_through_manager(&state, &request.url) {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => {
+            remove_persisted_worker(&state, &request.url);
+            if let Err(error) = persist_revision(&state, "worker removed") {
+                return persistence_error(error);
+            }
+            (StatusCode::OK, Json(response)).into_response()
+        }
         Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
     }
 }
@@ -479,9 +594,16 @@ async fn api_replace_worker(
     State(state): State<Arc<ControlState>>,
     Json(request): Json<ReplaceWorkerRequest>,
 ) -> Response {
-    match add_worker_through_manager(&state, request.new_worker).await {
+    match add_worker_through_manager(&state, request.new_worker.clone()).await {
         Ok(_) => match remove_worker_through_manager(&state, &request.old_url) {
-            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Ok(response) => {
+                remove_persisted_worker(&state, &request.old_url);
+                upsert_persisted_worker(&state, request.new_worker);
+                if let Err(error) = persist_revision(&state, "worker replaced") {
+                    return persistence_error(error);
+                }
+                (StatusCode::OK, Json(response)).into_response()
+            }
             Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
         },
         Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
@@ -532,17 +654,15 @@ async fn api_set_default_policy(
     State(state): State<Arc<ControlState>>,
     Json(request): Json<PolicyUpdateRequest>,
 ) -> Response {
-    match policy_from_request(&request) {
-        Ok((policy_config, policy)) => {
-            initialize_policy_if_needed(
-                &policy,
-                &state.app_state.context.worker_registry.get_all(),
-            );
-            state
-                .app_state
-                .context
-                .policy_registry
-                .set_default_policy(policy);
+    match apply_default_policy_request(&state, &request) {
+        Ok(policy_config) => {
+            {
+                let mut store = state.config_store.write().unwrap();
+                store.current.default_policy = request;
+            }
+            if let Err(error) = persist_revision(&state, "default policy updated") {
+                return persistence_error(error);
+            }
             (
                 StatusCode::OK,
                 Json(PolicyUpdateResponse {
@@ -561,19 +681,18 @@ async fn api_set_model_policy(
     Path(model_id): Path<String>,
     Json(request): Json<PolicyUpdateRequest>,
 ) -> Response {
-    match policy_from_request(&request) {
-        Ok((policy_config, policy)) => {
-            let workers = state
-                .app_state
-                .context
-                .worker_registry
-                .get_by_model_fast(&model_id);
-            initialize_policy_if_needed(&policy, &workers);
-            state
-                .app_state
-                .context
-                .policy_registry
-                .set_policy_for_model(&model_id, policy);
+    match apply_model_policy_request(&state, &model_id, &request) {
+        Ok(policy_config) => {
+            {
+                let mut store = state.config_store.write().unwrap();
+                store
+                    .current
+                    .model_policies
+                    .insert(model_id.clone(), request);
+            }
+            if let Err(error) = persist_revision(&state, "model policy updated") {
+                return persistence_error(error);
+            }
             (
                 StatusCode::OK,
                 Json(PolicyUpdateResponse {
@@ -596,11 +715,29 @@ async fn api_clear_model_policy(
         .context
         .policy_registry
         .remove_policy_for_model(&model_id);
+    {
+        let mut store = state.config_store.write().unwrap();
+        store.current.model_policies.remove(&model_id);
+    }
+    if let Err(error) = persist_revision(&state, "model policy cleared") {
+        return persistence_error(error);
+    }
     (
         StatusCode::OK,
         Json(PolicyUpdateResponse {
             target: model_id,
             policy: "default".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+fn persistence_error(error: anyhow::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(WorkerErrorResponse {
+            error: error.to_string(),
+            code: "PERSISTENCE_ERROR".to_string(),
         }),
     )
         .into_response()
@@ -650,7 +787,7 @@ async fn api_update_circuit_breaker_config(
     let applied_workers = if let Some(url) = request.url.as_deref() {
         match state.app_state.context.worker_registry.get_by_url(url) {
             Some(worker) => {
-                worker.circuit_breaker().update_config(updated);
+                worker.circuit_breaker().update_config(updated.clone());
                 1
             }
             None => 0,
@@ -663,6 +800,23 @@ async fn api_update_circuit_breaker_config(
         }
         workers.len()
     };
+
+    {
+        let mut store = state.config_store.write().unwrap();
+        let updated_view = CircuitBreakerConfigView::from_config(&updated);
+        if let Some(url) = request.url.as_ref() {
+            store
+                .current
+                .worker_circuit_breakers
+                .insert(url.clone(), updated_view);
+        } else {
+            store.current.default_circuit_breaker = updated_view;
+            store.current.worker_circuit_breakers.clear();
+        }
+    }
+    if let Err(error) = persist_revision(&state, "circuit breaker config updated") {
+        return persistence_error(error);
+    }
 
     (
         StatusCode::OK,
@@ -713,7 +867,7 @@ async fn api_update_health_config(
     let applied_workers = if let Some(url) = request.url.as_deref() {
         match state.app_state.context.worker_registry.get_by_url(url) {
             Some(worker) => {
-                worker.update_health_config(updated);
+                worker.update_health_config(updated.clone());
                 1
             }
             None => 0,
@@ -727,6 +881,23 @@ async fn api_update_health_config(
         workers.len()
     };
 
+    {
+        let mut store = state.config_store.write().unwrap();
+        let updated_view = HealthConfigView::from_config(&updated);
+        if let Some(url) = request.url.as_ref() {
+            store
+                .current
+                .worker_health
+                .insert(url.clone(), updated_view);
+        } else {
+            store.current.default_health = updated_view;
+            store.current.worker_health.clear();
+        }
+    }
+    if let Err(error) = persist_revision(&state, "health config updated") {
+        return persistence_error(error);
+    }
+
     (
         StatusCode::OK,
         Json(RuntimeConfigUpdateResponse {
@@ -738,6 +909,75 @@ async fn api_update_health_config(
             },
             applied_workers,
             runtime_config: runtime_config_view(&state),
+        }),
+    )
+        .into_response()
+}
+
+async fn api_config_history(State(state): State<Arc<ControlState>>) -> Json<ConfigHistoryView> {
+    let store = state.config_store.read().unwrap();
+    Json(ConfigHistoryView {
+        current_revision: store.current_revision_id(),
+        revisions: store
+            .revisions
+            .iter()
+            .rev()
+            .map(ConfigRevisionSummary::from_revision)
+            .collect(),
+    })
+}
+
+async fn api_config_rollback(
+    State(state): State<Arc<ControlState>>,
+    Json(request): Json<RollbackRequest>,
+) -> Response {
+    let target = {
+        let store = state.config_store.read().unwrap();
+        store
+            .revisions
+            .iter()
+            .find(|revision| revision.id == request.revision_id)
+            .cloned()
+    };
+
+    let Some(target) = target else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(WorkerErrorResponse {
+                error: format!("Revision {} not found", request.revision_id),
+                code: "REVISION_NOT_FOUND".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    if let Err(error) = apply_persisted_config(&state, &target.config).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(WorkerErrorResponse {
+                error: error.to_string(),
+                code: "ROLLBACK_FAILED".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    {
+        let mut store = state.config_store.write().unwrap();
+        store.current = target.config;
+    }
+
+    if let Err(error) = persist_revision(&state, &format!("rollback to {}", request.revision_id)) {
+        return persistence_error(error);
+    }
+
+    let current_revision = state.config_store.read().unwrap().current_revision_id();
+    (
+        StatusCode::OK,
+        Json(ConfigActionResponse {
+            success: true,
+            message: format!("Rolled back to revision {}", request.revision_id),
+            current_revision,
         }),
     )
         .into_response()
@@ -877,6 +1117,8 @@ fn build_overview(state: &ControlState) -> Overview {
             .count(),
         max_worker_load: workers.iter().map(|worker| worker.load).max().unwrap_or(0),
     };
+    record_metric_point(state, stats.total_workers, stats.healthy_workers, &metrics);
+    let store = state.config_store.read().unwrap();
 
     Overview {
         default_policy: app_state
@@ -899,6 +1141,45 @@ fn build_overview(state: &ControlState) -> Overview {
         },
         metrics,
         runtime_config: runtime_config_view(state),
+        config: ConfigMetadataView {
+            current_revision: store.current_revision_id(),
+            revision_count: store.revisions.len(),
+            persistence_enabled: state.state_file.is_some(),
+            state_file: state
+                .state_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        },
+        trends: state.metric_history.read().unwrap().clone(),
+    }
+}
+
+fn record_metric_point(
+    state: &ControlState,
+    total_workers: usize,
+    healthy_workers: usize,
+    metrics: &MetricsSummaryView,
+) {
+    let mut history = state.metric_history.write().unwrap();
+    let now = now_secs();
+    if history
+        .last()
+        .is_some_and(|point| point.timestamp_secs == now)
+    {
+        return;
+    }
+    history.push(MetricPoint {
+        timestamp_secs: now,
+        total_workers,
+        healthy_workers,
+        unavailable_workers: metrics.unavailable_workers,
+        open_circuits: metrics.open_circuits,
+        max_worker_load: metrics.max_worker_load,
+        total_processed_requests: metrics.total_processed_requests,
+    });
+    if history.len() > 120 {
+        let remove_count = history.len() - 120;
+        history.drain(0..remove_count);
     }
 }
 
@@ -989,6 +1270,27 @@ impl HealthConfigView {
             success_threshold: config.success_threshold,
         }
     }
+
+    fn to_core_config(&self) -> HealthConfig {
+        HealthConfig {
+            timeout_secs: self.timeout_secs,
+            check_interval_secs: self.check_interval_secs,
+            endpoint: self.endpoint.clone(),
+            failure_threshold: self.failure_threshold,
+            success_threshold: self.success_threshold,
+        }
+    }
+}
+
+impl CircuitBreakerConfigView {
+    fn to_core_config(&self) -> CircuitBreakerConfig {
+        CircuitBreakerConfig {
+            failure_threshold: self.failure_threshold,
+            success_threshold: self.success_threshold,
+            timeout_duration: Duration::from_secs(self.timeout_duration_secs),
+            window_duration: Duration::from_secs(self.window_duration_secs),
+        }
+    }
 }
 
 fn merge_circuit_breaker_config(
@@ -1039,6 +1341,22 @@ fn apply_runtime_defaults_to_worker(state: &ControlState, worker: &Arc<dyn Worke
     worker.update_health_config(state.default_health_config.read().unwrap().clone());
 }
 
+fn upsert_persisted_worker(state: &ControlState, config: WorkerConfigRequest) {
+    let mut store = state.config_store.write().unwrap();
+    store
+        .current
+        .workers
+        .retain(|worker| worker.url != config.url);
+    store.current.workers.push(config);
+}
+
+fn remove_persisted_worker(state: &ControlState, url: &str) {
+    let mut store = state.config_store.write().unwrap();
+    store.current.workers.retain(|worker| worker.url != url);
+    store.current.worker_circuit_breakers.remove(url);
+    store.current.worker_health.remove(url);
+}
+
 fn policy_from_request(
     request: &PolicyUpdateRequest,
 ) -> Result<(PolicyConfig, Arc<dyn LoadBalancingPolicy>)> {
@@ -1074,6 +1392,298 @@ fn initialize_policy_if_needed(policy: &Arc<dyn LoadBalancingPolicy>, workers: &
     if policy.requires_initialization() {
         policy.init_workers(workers);
     }
+}
+
+fn apply_default_policy_request(
+    state: &ControlState,
+    request: &PolicyUpdateRequest,
+) -> Result<PolicyConfig> {
+    let (policy_config, policy) = policy_from_request(request)?;
+    initialize_policy_if_needed(&policy, &state.app_state.context.worker_registry.get_all());
+    state
+        .app_state
+        .context
+        .policy_registry
+        .set_default_policy(policy);
+    Ok(policy_config)
+}
+
+fn apply_model_policy_request(
+    state: &ControlState,
+    model_id: &str,
+    request: &PolicyUpdateRequest,
+) -> Result<PolicyConfig> {
+    let (policy_config, policy) = policy_from_request(request)?;
+    let workers = state
+        .app_state
+        .context
+        .worker_registry
+        .get_by_model_fast(model_id);
+    initialize_policy_if_needed(&policy, &workers);
+    state
+        .app_state
+        .context
+        .policy_registry
+        .set_policy_for_model(model_id, policy);
+    Ok(policy_config)
+}
+
+async fn apply_persisted_config(state: &ControlState, config: &PersistedConfig) -> Result<()> {
+    let desired_urls = config
+        .workers
+        .iter()
+        .map(|worker| worker.url.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let current_workers = state.app_state.context.worker_registry.get_all();
+
+    for worker in current_workers {
+        if !desired_urls.contains(worker.url()) {
+            remove_worker_through_manager(state, worker.url()).map_err(|error| {
+                anyhow!("failed to remove worker {}: {}", worker.url(), error.error)
+            })?;
+        }
+    }
+
+    for worker_config in &config.workers {
+        if state
+            .app_state
+            .context
+            .worker_registry
+            .get_by_url(&worker_config.url)
+            .is_none()
+        {
+            add_worker_through_manager(state, worker_config.clone())
+                .await
+                .map_err(|error| {
+                    anyhow!(
+                        "failed to add worker {}: {}",
+                        worker_config.url,
+                        error.error
+                    )
+                })?;
+        }
+    }
+
+    apply_default_policy_request(state, &config.default_policy)?;
+    for model_id in state
+        .app_state
+        .context
+        .policy_registry
+        .get_all_mappings()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        if !config.model_policies.contains_key(&model_id) {
+            state
+                .app_state
+                .context
+                .policy_registry
+                .remove_policy_for_model(&model_id);
+        }
+    }
+    for (model_id, policy_request) in &config.model_policies {
+        apply_model_policy_request(state, model_id, policy_request)?;
+    }
+
+    apply_runtime_snapshot(state, config);
+    Ok(())
+}
+
+fn apply_runtime_snapshot(state: &ControlState, config: &PersistedConfig) {
+    let default_cb = config.default_circuit_breaker.to_core_config();
+    let default_health = config.default_health.to_core_config();
+    *state.default_circuit_breaker_config.write().unwrap() = default_cb.clone();
+    *state.default_health_config.write().unwrap() = default_health.clone();
+
+    for worker in state.app_state.context.worker_registry.get_all() {
+        let cb = config
+            .worker_circuit_breakers
+            .get(worker.url())
+            .map(CircuitBreakerConfigView::to_core_config)
+            .unwrap_or_else(|| default_cb.clone());
+        let health = config
+            .worker_health
+            .get(worker.url())
+            .map(HealthConfigView::to_core_config)
+            .unwrap_or_else(|| default_health.clone());
+        worker.circuit_breaker().update_config(cb);
+        worker.update_health_config(health);
+    }
+}
+
+fn load_config_store(state_file: Option<&PathBuf>) -> Result<Option<ConfigStore>> {
+    let Some(path) = state_file else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read state file {}", path.display()))?;
+    let store = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse state file {}", path.display()))?;
+    Ok(Some(store))
+}
+
+fn initial_persisted_config(
+    cli: &Cli,
+    router_config: &RouterConfig,
+    persisted_store: Option<&ConfigStore>,
+) -> Result<PersistedConfig> {
+    if let Some(store) = persisted_store {
+        return Ok(store.current.clone());
+    }
+
+    Ok(PersistedConfig {
+        workers: cli
+            .worker_urls
+            .iter()
+            .map(|worker_url| WorkerConfigRequest {
+                url: worker_url.clone(),
+                model_id: None,
+                priority: None,
+                cost: None,
+                worker_type: Some("regular".to_string()),
+                bootstrap_port: None,
+                labels: HashMap::new(),
+            })
+            .collect(),
+        default_policy: policy_request_from_config(parse_policy_config(&cli.policy)?),
+        model_policies: HashMap::new(),
+        default_circuit_breaker: CircuitBreakerConfigView::from_config(
+            &default_circuit_breaker_config(router_config),
+        ),
+        default_health: HealthConfigView::from_config(&default_health_config(router_config)),
+        worker_circuit_breakers: HashMap::new(),
+        worker_health: HashMap::new(),
+    })
+}
+
+fn policy_request_from_config(config: PolicyConfig) -> PolicyUpdateRequest {
+    match config {
+        PolicyConfig::Random => PolicyUpdateRequest {
+            policy: "random".to_string(),
+            ..PolicyUpdateRequest::default()
+        },
+        PolicyConfig::RoundRobin => PolicyUpdateRequest {
+            policy: "round_robin".to_string(),
+            ..PolicyUpdateRequest::default()
+        },
+        PolicyConfig::CacheAware {
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
+            eviction_interval_secs,
+            max_tree_size,
+        } => PolicyUpdateRequest {
+            policy: "cache_aware".to_string(),
+            cache_threshold: Some(cache_threshold),
+            balance_abs_threshold: Some(balance_abs_threshold),
+            balance_rel_threshold: Some(balance_rel_threshold),
+            eviction_interval_secs: Some(eviction_interval_secs),
+            max_tree_size: Some(max_tree_size),
+            ..PolicyUpdateRequest::default()
+        },
+        PolicyConfig::PowerOfTwo {
+            load_check_interval_secs,
+        } => PolicyUpdateRequest {
+            policy: "power_of_two".to_string(),
+            load_check_interval_secs: Some(load_check_interval_secs),
+            ..PolicyUpdateRequest::default()
+        },
+        PolicyConfig::ConsistentHash { virtual_nodes } => PolicyUpdateRequest {
+            policy: "consistent_hash".to_string(),
+            virtual_nodes: Some(virtual_nodes),
+            ..PolicyUpdateRequest::default()
+        },
+        PolicyConfig::RendezvousHash => PolicyUpdateRequest {
+            policy: "rendezvous_hash".to_string(),
+            ..PolicyUpdateRequest::default()
+        },
+    }
+}
+
+fn persist_revision(state: &ControlState, description: &str) -> Result<()> {
+    let snapshot = {
+        let mut store = state.config_store.write().unwrap();
+        store.push_revision(description.to_string(), state.max_revisions);
+        store.clone()
+    };
+
+    if let Some(path) = state.state_file.as_ref() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create state dir {}", parent.display()))?;
+        }
+        let contents = serde_json::to_string_pretty(&snapshot)?;
+        fs::write(path, contents)
+            .with_context(|| format!("failed to write state file {}", path.display()))?;
+    }
+    Ok(())
+}
+
+impl Default for PolicyUpdateRequest {
+    fn default() -> Self {
+        Self {
+            policy: "round_robin".to_string(),
+            cache_threshold: None,
+            balance_abs_threshold: None,
+            balance_rel_threshold: None,
+            eviction_interval_secs: None,
+            max_tree_size: None,
+            load_check_interval_secs: None,
+            virtual_nodes: None,
+        }
+    }
+}
+
+impl ConfigStore {
+    fn new(current: PersistedConfig) -> Self {
+        Self {
+            current,
+            revisions: Vec::new(),
+        }
+    }
+
+    fn current_revision_id(&self) -> Option<u64> {
+        self.revisions.last().map(|revision| revision.id)
+    }
+
+    fn push_revision(&mut self, description: String, max_revisions: usize) {
+        let id = self.current_revision_id().unwrap_or(0) + 1;
+        self.revisions.push(ConfigRevision {
+            id,
+            timestamp_secs: now_secs(),
+            description,
+            config: self.current.clone(),
+        });
+
+        let keep = max_revisions.max(1);
+        if self.revisions.len() > keep {
+            let remove_count = self.revisions.len() - keep;
+            self.revisions.drain(0..remove_count);
+        }
+    }
+}
+
+impl ConfigRevisionSummary {
+    fn from_revision(revision: &ConfigRevision) -> Self {
+        Self {
+            id: revision.id,
+            timestamp_secs: revision.timestamp_secs,
+            description: revision.description.clone(),
+            workers: revision.config.workers.len(),
+            model_policies: revision.config.model_policies.len(),
+        }
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn circuit_state_name(state: vllm_router_rs::core::CircuitState) -> String {

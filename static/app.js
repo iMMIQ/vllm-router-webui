@@ -1,4 +1,5 @@
 const $ = (id) => document.getElementById(id);
+let autoRefreshTimer = null;
 
 async function request(url, options = {}) {
   const res = await fetch(url, {
@@ -38,6 +39,51 @@ function setInputValue(id, value) {
   $(id).value = value ?? "";
 }
 
+function renderBars(id, points, key) {
+  const el = $(id);
+  el.innerHTML = "";
+  const sample = points.slice(-40);
+  const max = Math.max(1, ...sample.map((point) => Number(point[key] || 0)));
+  for (const point of sample) {
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    bar.style.height = `${Math.max(3, (Number(point[key] || 0) / max) * 40)}px`;
+    el.appendChild(bar);
+  }
+}
+
+function renderRevisions(data) {
+  const tbody = $("revisions");
+  tbody.innerHTML = "";
+  for (const revision of data.revisions || []) {
+    const tr = document.createElement("tr");
+    const time = new Date(revision.timestamp_secs * 1000).toLocaleString();
+    tr.innerHTML = `
+      <td>${revision.id}</td>
+      <td>${time}</td>
+      <td>${revision.description}</td>
+      <td>${revision.workers}</td>
+      <td>${revision.model_policies}</td>
+      <td><button data-revision="${revision.id}">Rollback</button></td>
+    `;
+    tbody.appendChild(tr);
+  }
+  tbody.querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        await request("/api/config/rollback", {
+          method: "POST",
+          body: JSON.stringify({ revision_id: Number(btn.dataset.revision) }),
+        });
+        await refresh();
+        setStatus("Config rolled back", false);
+      } catch (err) {
+        setStatus(err.message);
+      }
+    });
+  });
+}
+
 function render(data) {
   $("total-workers").textContent = data.stats.total_workers;
   $("healthy-workers").textContent = data.stats.healthy_workers;
@@ -47,6 +93,15 @@ function render(data) {
   $("unavailable-workers").textContent = data.metrics.unavailable_workers;
   $("open-circuits").textContent = data.metrics.open_circuits;
   $("max-load").textContent = data.metrics.max_worker_load;
+  $("current-revision").textContent = data.config.current_revision ?? "-";
+  $("revision-count").textContent = data.config.revision_count;
+  $("persistence-state").textContent = data.config.persistence_enabled ? "on" : "off";
+  $("trend-points").textContent = data.trends.length;
+  $("trend-processed").textContent = data.metrics.total_processed_requests;
+  $("trend-open-circuits").textContent = data.metrics.open_circuits;
+  $("trend-unavailable").textContent = data.metrics.unavailable_workers;
+  renderBars("processed-trend", data.trends, "total_processed_requests");
+  renderBars("circuit-trend", data.trends, "open_circuits");
   setInputValue("cb-failure-threshold", data.runtime_config.circuit_breaker.failure_threshold);
   setInputValue("cb-success-threshold", data.runtime_config.circuit_breaker.success_threshold);
   setInputValue("cb-timeout-duration-secs", data.runtime_config.circuit_breaker.timeout_duration_secs);
@@ -114,9 +169,20 @@ function render(data) {
 async function refresh() {
   const data = await request("/api/overview");
   render(data);
+  const history = await request("/api/config/history");
+  renderRevisions(history);
 }
 
 $("refresh").addEventListener("click", () => refresh().catch((err) => setStatus(err.message)));
+
+$("auto-refresh").addEventListener("change", () => {
+  if ($("auto-refresh").checked) {
+    autoRefreshTimer = setInterval(() => refresh().catch((err) => setStatus(err.message)), 3000);
+  } else if (autoRefreshTimer) {
+    clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+});
 
 $("add-worker").addEventListener("submit", async (ev) => {
   ev.preventDefault();

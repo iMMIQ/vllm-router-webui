@@ -38,12 +38,20 @@ fn test_cli(port: u16) -> Cli {
         max_payload_size: 16 * 1024 * 1024,
         request_timeout_secs: 10,
         max_concurrent_requests: 128,
+        prometheus_host: "127.0.0.1".to_string(),
+        prometheus_port: None,
     }
 }
 
 async fn spawn_webui() -> TestServer {
+    spawn_webui_with_cli(test_cli(pick_unused_port().expect("free webui port"))).await
+}
+
+async fn spawn_webui_with_cli(cli: Cli) -> TestServer {
     let port = pick_unused_port().expect("free webui port");
-    let app = build_application(test_cli(port))
+    let mut cli = cli;
+    cli.port = port;
+    let app = build_application(cli.clone())
         .await
         .expect("build webui app");
     let listener = TcpListener::bind(("127.0.0.1", port))
@@ -168,7 +176,7 @@ async fn webui_adds_lists_routes_and_removes_worker() {
             "url": worker.base_url,
             "model_id": "test-model",
             "worker_type": "regular",
-            "labels": {"policy": "round_robin"}
+            "labels": {"policy": "power_of_two"}
         }))
         .send()
         .await
@@ -190,6 +198,9 @@ async fn webui_adds_lists_routes_and_removes_worker() {
         .unwrap();
     assert_eq!(overview["stats"]["total_workers"], 1);
     assert_eq!(overview["workers"][0]["model_id"], "test-model");
+    assert_eq!(overview["workers"][0]["circuit_breaker"]["state"], "closed");
+    assert_eq!(overview["workers"][0]["is_available"], true);
+    assert_eq!(overview["metrics"]["unavailable_workers"], 0);
 
     let routed = client
         .post(format!("{}/v1/completions", webui.base_url))
@@ -206,6 +217,16 @@ async fn webui_adds_lists_routes_and_removes_worker() {
     assert_eq!(routed.headers().get("x-worker-id").unwrap(), "worker-a");
     let routed_body: Value = routed.json().await.unwrap();
     assert_eq!(routed_body["worker_id"], "worker-a");
+
+    let overview: Value = client
+        .get(format!("{}/api/overview", webui.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(overview["metrics"]["total_processed_requests"].is_number());
 
     let removed = client
         .delete(format!("{}/api/workers", webui.base_url))
@@ -371,4 +392,102 @@ async fn replaces_worker_and_updates_policies_without_restarting_server() {
         .unwrap();
     assert_eq!(routed.status(), reqwest::StatusCode::OK);
     assert_eq!(routed.headers().get("x-worker-id").unwrap(), "worker-b");
+}
+
+#[tokio::test]
+async fn circuit_control_opens_and_resets_worker_availability() {
+    let webui = spawn_webui().await;
+    let worker = spawn_worker("worker-a", "test-model").await;
+    let client = reqwest::Client::new();
+
+    let add = client
+        .post(format!("{}/api/workers", webui.base_url))
+        .json(&json!({
+            "url": worker.base_url,
+            "model_id": "test-model",
+            "worker_type": "regular"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(add.status(), reqwest::StatusCode::OK);
+
+    let opened = client
+        .post(format!("{}/api/workers/circuit/open", webui.base_url))
+        .json(&json!({ "url": worker.base_url }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), reqwest::StatusCode::OK);
+    let opened_body: Value = opened.json().await.unwrap();
+    assert_eq!(opened_body["worker"]["circuit_breaker"]["state"], "open");
+    assert_eq!(opened_body["worker"]["is_available"], false);
+
+    let overview: Value = client
+        .get(format!("{}/api/overview", webui.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(overview["metrics"]["open_circuits"], 1);
+    assert_eq!(overview["metrics"]["unavailable_workers"], 1);
+
+    let rejected = client
+        .post(format!("{}/v1/completions", webui.base_url))
+        .json(&json!({
+            "model": "test-model",
+            "prompt": "blocked",
+            "max_tokens": 1,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(!rejected.status().is_success());
+
+    let reset = client
+        .post(format!("{}/api/workers/circuit/reset", webui.base_url))
+        .json(&json!({ "url": worker.base_url }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), reqwest::StatusCode::OK);
+    let reset_body: Value = reset.json().await.unwrap();
+    assert_eq!(reset_body["worker"]["circuit_breaker"]["state"], "closed");
+    assert_eq!(reset_body["worker"]["is_available"], true);
+
+    let routed = client
+        .post(format!("{}/v1/completions", webui.base_url))
+        .json(&json!({
+            "model": "test-model",
+            "prompt": "after reset",
+            "max_tokens": 1,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(routed.status(), reqwest::StatusCode::OK);
+    assert_eq!(routed.headers().get("x-worker-id").unwrap(), "worker-a");
+}
+
+#[tokio::test]
+async fn prometheus_metrics_server_can_be_enabled() {
+    let metrics_port = pick_unused_port().expect("free prometheus port");
+    let mut cli = test_cli(pick_unused_port().expect("free webui port"));
+    cli.prometheus_port = Some(metrics_port);
+    let _webui = spawn_webui_with_cli(cli).await;
+    let metrics_url = format!("http://127.0.0.1:{metrics_port}/metrics");
+
+    wait_for_http_ok(&metrics_url).await;
+    let body = reqwest::get(metrics_url)
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("vllm_router_requests_total"));
+    assert!(body.contains("vllm_router_cb_state"));
 }

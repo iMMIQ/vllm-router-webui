@@ -16,6 +16,7 @@ use tracing::{info, warn};
 use vllm_router_rs::{
     config::{PolicyConfig, RouterConfig, RoutingMode},
     core::WorkerType,
+    metrics::{self, PrometheusConfig},
     policies::{CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory},
     protocols::worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     routers::{
@@ -64,6 +65,14 @@ pub struct Cli {
     /// Maximum concurrent proxied requests.
     #[arg(long, default_value_t = 1024)]
     pub max_concurrent_requests: usize,
+
+    /// Host address for the optional Prometheus metrics server.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub prometheus_host: String,
+
+    /// Port for the optional Prometheus metrics server. Disabled when omitted.
+    #[arg(long)]
+    pub prometheus_port: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -81,6 +90,7 @@ struct Overview {
     worker_counts: HashMap<String, usize>,
     workers: Vec<WorkerView>,
     stats: WorkerStatsView,
+    metrics: MetricsSummaryView,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,8 +100,11 @@ struct WorkerView {
     worker_type: String,
     is_healthy: bool,
     load: usize,
+    processed_requests: usize,
+    is_available: bool,
     priority: u32,
     cost: f32,
+    circuit_breaker: CircuitBreakerView,
     metadata: HashMap<String, String>,
 }
 
@@ -106,8 +119,33 @@ struct WorkerStatsView {
     decode_workers: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct MetricsSummaryView {
+    total_processed_requests: usize,
+    unavailable_workers: usize,
+    open_circuits: usize,
+    half_open_circuits: usize,
+    max_worker_load: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct CircuitBreakerView {
+    state: String,
+    consecutive_failures: u32,
+    consecutive_successes: u32,
+    total_failures: u64,
+    total_successes: u64,
+    time_since_last_failure_ms: Option<u128>,
+    time_since_state_change_ms: u128,
+}
+
 #[derive(Debug, Deserialize)]
 struct RemoveWorkerRequest {
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerUrlRequest {
     url: String,
 }
 
@@ -128,6 +166,13 @@ struct PolicyUpdateResponse {
     policy: String,
 }
 
+#[derive(Debug, Serialize)]
+struct CircuitActionResponse {
+    success: bool,
+    message: String,
+    worker: WorkerView,
+}
+
 pub async fn launch(cli: Cli) -> Result<()> {
     let app = build_application(cli.clone()).await?;
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port)
@@ -144,6 +189,17 @@ pub async fn launch(cli: Cli) -> Result<()> {
 
 pub async fn build_application(cli: Cli) -> Result<Router> {
     let router_config = build_router_config(&cli)?;
+    if let Some(port) = cli.prometheus_port {
+        metrics::start_prometheus(PrometheusConfig {
+            host: cli.prometheus_host.clone(),
+            port,
+        });
+        info!(
+            "Prometheus metrics server enabled on {}:{}",
+            cli.prometheus_host, port
+        );
+    }
+
     let client = Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(50)))
         .pool_max_idle_per_host(500)
@@ -248,6 +304,8 @@ pub async fn build_application(cli: Cli) -> Result<Router> {
         .route("/api/workers", post(api_add_worker))
         .route("/api/workers", delete(api_remove_worker))
         .route("/api/workers/replace", post(api_replace_worker))
+        .route("/api/workers/circuit/open", post(api_force_open_circuit))
+        .route("/api/workers/circuit/reset", post(api_reset_circuit))
         .route("/api/policies/default", post(api_set_default_policy))
         .route(
             "/api/policies/models/{model_id}",
@@ -357,6 +415,46 @@ async fn api_replace_worker(
             Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
         },
         Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
+    }
+}
+
+async fn api_force_open_circuit(
+    State(state): State<Arc<ControlState>>,
+    Json(request): Json<WorkerUrlRequest>,
+) -> Response {
+    match get_worker_view_by_url(&state.app_state, &request.url, |worker| {
+        worker.circuit_breaker().force_open();
+    }) {
+        Ok(worker) => (
+            StatusCode::OK,
+            Json(CircuitActionResponse {
+                success: true,
+                message: format!("Circuit opened for {}", request.url),
+                worker,
+            }),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::NOT_FOUND, Json(error)).into_response(),
+    }
+}
+
+async fn api_reset_circuit(
+    State(state): State<Arc<ControlState>>,
+    Json(request): Json<WorkerUrlRequest>,
+) -> Response {
+    match get_worker_view_by_url(&state.app_state, &request.url, |worker| {
+        worker.circuit_breaker().reset();
+    }) {
+        Ok(worker) => (
+            StatusCode::OK,
+            Json(CircuitActionResponse {
+                success: true,
+                message: format!("Circuit reset for {}", request.url),
+                worker,
+            }),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::NOT_FOUND, Json(error)).into_response(),
     }
 }
 
@@ -494,6 +592,26 @@ fn remove_worker_through_manager(
     router_manager.remove_worker_from_registry(url)
 }
 
+fn get_worker_view_by_url<F>(
+    app_state: &Arc<AppState>,
+    url: &str,
+    action: F,
+) -> Result<WorkerView, WorkerErrorResponse>
+where
+    F: FnOnce(&Arc<dyn vllm_router_rs::core::Worker>),
+{
+    let worker = app_state
+        .context
+        .worker_registry
+        .get_by_url(url)
+        .ok_or_else(|| WorkerErrorResponse {
+            error: format!("Worker {url} not found"),
+            code: "WORKER_NOT_FOUND".to_string(),
+        })?;
+    action(&worker);
+    Ok(worker_to_view(worker))
+}
+
 async fn wait_for_worker_health(state: &ControlState, worker_url: &str) -> Result<(), String> {
     let health_url = format!(
         "{}{}",
@@ -535,21 +653,22 @@ fn build_overview(app_state: &Arc<AppState>) -> Overview {
         .worker_registry
         .get_all()
         .into_iter()
-        .map(|worker| WorkerView {
-            url: worker.url().to_string(),
-            model_id: worker.model_id().to_string(),
-            worker_type: match worker.worker_type() {
-                WorkerType::Regular => "regular".to_string(),
-                WorkerType::Prefill { .. } => "prefill".to_string(),
-                WorkerType::Decode => "decode".to_string(),
-            },
-            is_healthy: worker.is_healthy(),
-            load: worker.load(),
-            priority: worker.priority(),
-            cost: worker.cost(),
-            metadata: worker.metadata().labels.clone(),
-        })
-        .collect();
+        .map(worker_to_view)
+        .collect::<Vec<_>>();
+
+    let metrics = MetricsSummaryView {
+        total_processed_requests: workers.iter().map(|worker| worker.processed_requests).sum(),
+        unavailable_workers: workers.iter().filter(|worker| !worker.is_available).count(),
+        open_circuits: workers
+            .iter()
+            .filter(|worker| worker.circuit_breaker.state == "open")
+            .count(),
+        half_open_circuits: workers
+            .iter()
+            .filter(|worker| worker.circuit_breaker.state == "half_open")
+            .count(),
+        max_worker_load: workers.iter().map(|worker| worker.load).max().unwrap_or(0),
+    };
 
     Overview {
         default_policy: app_state
@@ -570,7 +689,48 @@ fn build_overview(app_state: &Arc<AppState>) -> Overview {
             prefill_workers: stats.prefill_workers,
             decode_workers: stats.decode_workers,
         },
+        metrics,
     }
+}
+
+fn worker_to_view(worker: Arc<dyn vllm_router_rs::core::Worker>) -> WorkerView {
+    let cb_stats = worker.circuit_breaker().stats();
+    WorkerView {
+        url: worker.url().to_string(),
+        model_id: worker.model_id().to_string(),
+        worker_type: match worker.worker_type() {
+            WorkerType::Regular => "regular".to_string(),
+            WorkerType::Prefill { .. } => "prefill".to_string(),
+            WorkerType::Decode => "decode".to_string(),
+        },
+        is_healthy: worker.is_healthy(),
+        load: worker.load(),
+        processed_requests: worker.processed_requests(),
+        is_available: worker.is_available(),
+        priority: worker.priority(),
+        cost: worker.cost(),
+        circuit_breaker: CircuitBreakerView {
+            state: circuit_state_name(cb_stats.state),
+            consecutive_failures: cb_stats.consecutive_failures,
+            consecutive_successes: cb_stats.consecutive_successes,
+            total_failures: cb_stats.total_failures,
+            total_successes: cb_stats.total_successes,
+            time_since_last_failure_ms: cb_stats
+                .time_since_last_failure
+                .map(|duration| duration.as_millis()),
+            time_since_state_change_ms: cb_stats.time_since_last_state_change.as_millis(),
+        },
+        metadata: worker.metadata().labels.clone(),
+    }
+}
+
+fn circuit_state_name(state: vllm_router_rs::core::CircuitState) -> String {
+    match state {
+        vllm_router_rs::core::CircuitState::Closed => "closed",
+        vllm_router_rs::core::CircuitState::Open => "open",
+        vllm_router_rs::core::CircuitState::HalfOpen => "half_open",
+    }
+    .to_string()
 }
 
 async fn shutdown_signal() {

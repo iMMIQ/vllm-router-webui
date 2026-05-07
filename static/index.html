@@ -70,8 +70,9 @@
       th, td { border-bottom: 1px solid var(--line); padding: 9px 8px; text-align: left; vertical-align: middle; }
       th { color: var(--muted); font-size: 12px; font-weight: 600; }
       .status { color: var(--danger); min-height: 20px; }
-      .healthy { color: var(--ok); font-weight: 600; }
-      .unhealthy { color: var(--danger); font-weight: 600; }
+      .healthy, .closed, .available { color: var(--ok); font-weight: 600; }
+      .unhealthy, .open, .unavailable { color: var(--danger); font-weight: 600; }
+      .half_open { color: #9b6500; font-weight: 600; }
       .toolbar { display: flex; gap: 10px; align-items: center; justify-content: flex-end; }
       @media (max-width: 820px) {
         main { padding: 14px; }
@@ -96,6 +97,10 @@
           <div class="metric"><b id="healthy-workers">0</b><span>Healthy workers</span></div>
           <div class="metric"><b id="total-models">0</b><span>Models</span></div>
           <div class="metric"><b id="default-policy">-</b><span>Default policy</span></div>
+          <div class="metric"><b id="total-processed">0</b><span>Processed requests</span></div>
+          <div class="metric"><b id="unavailable-workers">0</b><span>Unavailable workers</span></div>
+          <div class="metric"><b id="open-circuits">0</b><span>Open circuits</span></div>
+          <div class="metric"><b id="max-load">0</b><span>Max worker load</span></div>
         </div>
       </section>
 
@@ -167,7 +172,11 @@
               <th>Model</th>
               <th>Type</th>
               <th>Health</th>
+              <th>Available</th>
+              <th>Circuit</th>
               <th>Load</th>
+              <th>Processed</th>
+              <th>Failures</th>
               <th>Actions</th>
             </tr>
           </thead>

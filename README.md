@@ -1,5 +1,7 @@
 # vLLM Router WebUI
 
+[中文文档](README.zh-CN.md)
+
 Single-binary WebUI and control plane for `vllm-project/router`.
 
 The upstream router is imported as a Git submodule under `vendor/router`. This
@@ -262,3 +264,7 @@ upstream state mutable at runtime:
 - runtime circuit breaker config updates without resetting worker state
 - runtime health check config updates on existing workers
 - configurable virtual node count for consistent hashing
+
+## License
+
+This project is licensed under GPLv3. See [LICENSE](LICENSE).
